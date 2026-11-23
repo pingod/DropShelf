@@ -157,6 +157,7 @@ void pages_animate(double time);
 /// 概览页卡片的高度：窗口较高时拉长卡片填满页面，避免纵向留白。viewport 是概览页可见范围的高度。
 /// 卡片高度变了时返回 true，调用方要重新量一次概览页。
 bool pages_update_card_height(float viewport, bool resized);
+void pages_trace_layout(float width, float viewport, bool resized);
 /// 画概览页的一张卡片：matrix 把卡片从排版的位置变到现在的样子（翻牌时）。
 void pages_paint_tile_face(UiElement *tile, GfxMatrix matrix, float opacity);
 /// 主窗口关闭：还没保存的灵敏度立即保存，记着的元素都清掉。

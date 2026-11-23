@@ -2,6 +2,7 @@
 #include "main_window_internal.h"
 #include "ui_internal.h"
 #include "file_dialog.h"
+#include "log.h"
 #include "file_ops.h"
 #include "foreground.h"
 #include "gesture.h"
@@ -826,6 +827,22 @@ static void tile_set_summary(UiElement *element, wchar_t *summary)
     tile->summary = summary;
     tile_split_summary(tile);
     ui_window_repaint(element->window);
+}
+
+/// 临时诊断：DROPSHELF_TRACE=1 时，概览页排版的数值有变化就记一行。
+void pages_trace_layout(float width, float viewport, bool resized)
+{
+    UiElement *page = M->overview_page;
+    if (!page || !log_trace_enabled()) return;
+    float grid = M->tile_grid->desired.height + M->tile_grid->margin_top + M->tile_grid->margin_bottom;
+    float values[12] = { width, viewport, page->desired.height, grid, P.card_target, M->tiles[0]->height, (float)P.card_height.value,
+        M->tiles[0]->bounds.top, M->tiles[2]->bounds.bottom, ui_scroll_offset(M->overview_scroll), M->history_section->hidden ? 1.0f : 0.0f,
+        M->overview_header->hidden ? 1.0f : 0.0f };
+    static float last[12];
+    if (memcmp(values, last, sizeof(values)) == 0) return;
+    memcpy(last, values, sizeof(values));
+    log_trace(L"[诊断] 排版：宽 %.3f 可见高 %.3f 页面 %.3f 卡片区 %.3f 目标 %.0f 卡片 %.3f 动画值 %.3f 卡片上沿 %.3f 下沿 %.3f 滚动 %.2f 历史隐藏 %.0f 标题隐藏 %.0f 刚改大小 %d",
+        values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9], values[10], values[11], resized);
 }
 
 bool pages_update_card_height(float viewport, bool resized)

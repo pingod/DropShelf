@@ -2,6 +2,7 @@
 #include "main_window_internal.h"
 #include "about_window.h"
 #include "lang.h"
+#include "log.h"
 #include "power.h"
 #include "shelf_history.h"
 #include "shelf_window.h"
@@ -776,6 +777,7 @@ static void root_arrange(UiElement *element)
     // 卡片高度按这次量出来的其余内容算；变了就再量一次，同一帧里就是新的高度，拖动窗口边缘时不会抖。
     if (pages_update_card_height(viewport, resized)) ui_measure(M->overview_scroll, width);
     ui_arrange(M->overview_scroll, M->stage);
+    pages_trace_layout(width, viewport, resized);
     for (int page = 0; page < PAGE_COUNT; page++)
     {
         ui_measure(M->pages[page].host, width);
@@ -942,6 +944,16 @@ static void on_animate(UiWindow *target, void *context, double time)
 {
     (void)target;
     (void)context;
+    // 临时诊断：DROPSHELF_TRACE=1 时记下主窗口每秒画了几帧。
+    static double trace_second;
+    static int trace_frames;
+    trace_frames++;
+    if (time - trace_second >= 1)
+    {
+        if (trace_second > 0 && time - trace_second < 1.5) log_trace(L"[诊断] 主窗口这一秒画了 %d 帧", trace_frames);
+        trace_second = time;
+        trace_frames = 0;
+    }
     if (side_panel_pending)
     {
         side_panel_pending = false;
