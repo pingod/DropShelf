@@ -1603,6 +1603,7 @@ static void test_drop_classify(void)
 #include "merge_tests.inc"
 #include "main_tests.inc"
 #include "watch_tests.inc"
+#include "diag_tests.inc"
 
 /// 命令行给了名字时只跑名字里含有其中之一的测试，方便单独排查。
 static char **only_tests;
@@ -1704,6 +1705,7 @@ int main(int argc, char **argv)
     run("shadow templates", test_shadow_templates);
     run("graphics trim", test_graphics_trim);
     run("gfx layers", test_gfx_layers);
+    run("card jitter", test_card_jitter);
     run("main window", test_main_window);
     run("main window settings", test_main_window_settings);
     run("calibration dialog", test_calibration_dialog);
