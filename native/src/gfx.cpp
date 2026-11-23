@@ -892,6 +892,8 @@ static ID2D1Bitmap1 *draw_shadow_template(float radius, float blur, float scale,
         template_context->SetTarget(shape);
         template_context->BeginDraw();
         template_context->SetTransform(D2D1::Matrix3x2F::Identity());
+        // 画刷是和牌背图案共用的，图案画完会留下半透明的线色；阴影只看形状的透明度，必须用不透明的黑。
+        template_brush->SetColor(D2D1::ColorF(0, 0, 0, 1));
         template_context->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0, 0, (float)side, (float)side), radius * scale, radius * scale),
             template_brush);
         result = template_context->EndDraw();
