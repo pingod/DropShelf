@@ -119,7 +119,7 @@ static GfxTextStyle rank_style(const CardCorner *corner)
 }
 
 /// 牌角占多大：宽是数字和花色里较宽的那个，高是数字那一行加上空隙和花色。
-static GfxSize corner_size(const wchar_t *rank, const CardCorner *corner)
+GfxSize card_corner_size(const wchar_t *rank, const CardCorner *corner)
 {
     GfxTextStyle style = rank_style(corner);
     float width = rank && *rank ? gfx_text_measure(rank, &style, 0).width : 0;
@@ -132,7 +132,7 @@ void card_paint_corner_rolling(const wchar_t *rank, FileSuit suit, const CardCor
     float rank_shift, float rank_opacity)
 {
     if (opacity <= 0.001f) return;
-    GfxSize size = corner_size(rank, corner);
+    GfxSize size = card_corner_size(rank, corner);
     float y = top;
     if (rank && *rank)
     {
@@ -156,7 +156,7 @@ void card_paint_corner_inverted(const wchar_t *rank, FileSuit suit, const CardCo
     float opacity)
 {
     if (opacity <= 0.001f) return;
-    GfxSize size = corner_size(rank, corner);
+    GfxSize size = card_corner_size(rank, corner);
     float left = card.right - right - size.width, top = card.bottom - bottom - size.height;
     gfx_push_transform(gfx_matrix_rotate(180, left + size.width / 2, top + size.height / 2));
     card_paint_corner(rank, suit, corner, left, top, color, opacity);

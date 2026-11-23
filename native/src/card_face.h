@@ -32,6 +32,9 @@ typedef struct CardCorner
     float suit_size, suit_gap;
 } CardCorner;
 
+/// 牌角占多大（数字和花色中较宽的那个、两者加起来的高度）。
+GfxSize card_corner_size(const wchar_t *rank, const CardCorner *corner);
+
 /// 左上角的牌角，(left, top) 是它的左上角；inverted 时把同样的牌角倒过来画在 card 的右下角，right、bottom 是到牌边的距离。
 void card_paint_corner(const wchar_t *rank, FileSuit suit, const CardCorner *corner, float left, float top, Color color, float opacity);
 /// 同上，但数字单独下移 rank_shift、乘上 rank_opacity（新牌落下时数字从下面滚上来），花色不动。
