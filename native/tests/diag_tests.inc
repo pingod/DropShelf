@@ -28,6 +28,33 @@ static bool diag_sample(const char *label, float width, float height)
     return moved || animating;
 }
 
+/// 不处理窗口消息，按 render 的顺序（先 pages_animate，再排版）自己走 frames 帧，窗口大小是给定的小数 DIP。
+/// 返回最后 30 帧里卡片有没有变过。
+static bool diag_simulate(const char *label, float width, float height, int frames)
+{
+    double time = frames_time();
+    float tops[200], bottoms[200];
+    for (int frame = 0; frame < frames && frame < 200; frame++)
+    {
+        time += 1.0 / 60;
+        pages_animate(time);
+        ui_measure(M->root, width);
+        ui_arrange(M->root, (GfxRect){ 0, 0, width, height });
+        tops[frame] = M->tiles[PAGE_ACTIONS]->bounds.top;
+        bottoms[frame] = M->tiles[PAGE_ACTIONS]->bounds.bottom;
+    }
+    bool moved = false;
+    for (int frame = frames - 30; frame < frames; frame++)
+        if (tops[frame] != tops[frames - 30] || bottoms[frame] != bottoms[frames - 30]) moved = true;
+    if (moved)
+    {
+        printf("  [模拟抖动] %s %.4fx%.4f:", label, width, height);
+        for (int frame = frames - 30; frame < frames; frame++) printf(" %.3f/%.3f", tops[frame], bottoms[frame]);
+        printf("\n");
+    }
+    return moved;
+}
+
 static void test_card_jitter(void)
 {
     language_set_mode(LANGUAGE_CHINESE);
@@ -75,7 +102,7 @@ static void test_card_jitter(void)
         }
         const float widths[] = { 900, 1300 };
         for (int w = 0; w < 2; w++)
-            for (float height = 520; height <= maximum_height; height += 9)
+            for (float height = 520; height <= maximum_height; height += 15)
             {
                 RECT rect = {0};
                 GetWindowRect(ui_window_handle(M->window), &rect);
@@ -99,6 +126,32 @@ static void test_card_jitter(void)
         pump_for(300);
     }
     printf("  [诊断] 共 %d 种情况，%d 种在动\n", checked, jitters);
+
+    // 模拟不同缩放比例下的小数窗口大小：每个大小先走 60 帧稳定下来，再看最后 30 帧。
+    const float scales[] = { 1.25f, 1.5f, 1.75f, 2.0f };
+    int simulated = 0, simulated_moving = 0;
+    for (int state = 0; state < 2; state++)
+    {
+        bool show = state == 1;
+        app_update_settings(diag_hide_getting_started, &show);
+        for (int s = 0; s < 4; s++)
+            for (int pixels = 900; pixels <= 1900; pixels += 5)
+            {
+                float height = pixels / scales[s];
+                float widths_px[] = { 1600, 2400 };
+                for (int w = 0; w < (s == 3 ? 2 : 1); w++)
+                {
+                    char label[64];
+                    snprintf(label, sizeof(label), "缩放%.2f %s", scales[s], show ? "入门" : "无入门");
+                    simulated++;
+                    if (diag_simulate(label, widths_px[w] / scales[s], height, 60)) simulated_moving++;
+                }
+            }
+    }
+    printf("  [诊断] 模拟 %d 种，%d 种在动\n", simulated, simulated_moving);
+    ui_window_invalidate(M->window);
+    pump_for(300);
+    CHECK(false, "诊断结束（故意失败，好让 ctest 显示上面的输出）");
     bool show = true;
     app_update_settings(diag_hide_getting_started, &show);
     shelf_history_clear();
