@@ -47,11 +47,13 @@ void xdnd_probe_hide(void);
 /// 坐标以置物架左上角为原点，和 GTK 拖放回调里拿到的一样。
 /// want_move：这次拖入按“移动”收尾吗（跟着置物架顶部的复制/移动开关走）；
 /// 返回 true 时来源程序在松手后会删掉原文，和真的移动一样。
+/// drop 返回这次的数据有没有收下：没收下时回 XdndFinished 失败，
+/// 来源按“移动”提议的话就不会删除原文。
 XdndSink *xdnd_add_sink(void *context,
     void (*enter)(void *context, XdndKind kind, double x, double y),
     void (*motion)(void *context, XdndKind kind, double x, double y),
     void (*leave)(void *context),
-    void (*drop)(void *context, const XdndPayload *payload, double x, double y),
+    bool (*drop)(void *context, const XdndPayload *payload, double x, double y),
     bool (*frame)(void *context, int *x, int *y, int *width, int *height),
     bool (*want_move)(void *context));
 void xdnd_remove_sink(XdndSink *sink);

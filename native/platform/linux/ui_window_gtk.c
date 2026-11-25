@@ -76,6 +76,7 @@ struct UiWindow
     guint drag_guard;                   // 拖动期间定时确认左键还按着
     gint64 drag_began_at;
     gint64 drag_released_at;            // 第一次看到左键松开的时间，0 表示还没松开
+    gint64 takeover_checked_at;         // 上次问 Hyprland 光标底下是不是 XWayland 程序的时间
     bool drag_active;
     bool drag_saw_button;               // 这次拖动期间至少看到过一次左键按着
     bool drag_stale;                    // 已经替 GTK 收过尾、GTK 那边还挂着：下次从这里拖出前取消掉
@@ -1129,6 +1130,8 @@ GdkDrag *ui_active_drag(void)
 /// 这里盯着全局左键：已经松开而 GTK 还没结束，就主动取消这次拖动。
 #define DRAG_GUARD_POLL_MILLISECONDS 50
 #define DRAG_GUARD_GRACE_MICROSECONDS 100000
+/// 问 Hyprland 光标底下是不是 XWayland 程序要读一遍全部窗口，50 毫秒一次太重；200 毫秒一次足够。
+#define TAKEOVER_CHECK_MICROSECONDS 200000
 // 松开以后还等一会儿：给合成器和接收方正常结束的机会，迟迟等不到才当作漏发。
 #define DRAG_GUARD_RELEASE_DELAY_MICROSECONDS 1000000
 
@@ -1181,11 +1184,16 @@ static gboolean drag_guard_tick(gpointer data)
         window->drag_guard = 0;
         return G_SOURCE_REMOVE;
     }
-    if (g_get_monotonic_time() - window->drag_began_at < DRAG_GUARD_GRACE_MICROSECONDS) return G_SOURCE_CONTINUE;
-    if (take_over_for_x11())
+    gint64 now = g_get_monotonic_time();
+    if (now - window->drag_began_at < DRAG_GUARD_GRACE_MICROSECONDS) return G_SOURCE_CONTINUE;
+    if (now - window->takeover_checked_at >= TAKEOVER_CHECK_MICROSECONDS)
     {
-        window->drag_guard = 0;
-        return G_SOURCE_REMOVE;
+        window->takeover_checked_at = now;
+        if (take_over_for_x11())
+        {
+            window->drag_guard = 0;
+            return G_SOURCE_REMOVE;
+        }
     }
     int buttons = gesture_left_button_state();
     // 没看到过按下就松开的不算：可能是触摸板这种看不到左键的设备，宁可不收也不能把正常拖动掐掉。
@@ -1489,6 +1497,7 @@ static void on_drag_begin(GtkDragSource *source, GdkDrag *drag, gpointer data)
     window->drag_saw_button = gesture_left_button_state() == 1;
     window->drag_released_at = 0;
     window->drag_began_at = g_get_monotonic_time();
+    window->takeover_checked_at = 0;  // 新一轮拖动：过了宽限期就先问一次
     // 文字拖动：把截短的标签换进拖动图标（prepare 里只放了个透明占位）。
     if (window->drag_icon_label)
     {

@@ -47,7 +47,7 @@ struct XdndSink
     void (*enter)(void *context, XdndKind kind, double x, double y);
     void (*motion)(void *context, XdndKind kind, double x, double y);
     void (*leave)(void *context);
-    void (*drop)(void *context, const XdndPayload *payload, double x, double y);
+    bool (*drop)(void *context, const XdndPayload *payload, double x, double y);
     bool (*frame)(void *context, int *x, int *y, int *width, int *height);
     bool (*want_move)(void *context);   // 这次拖入按移动收尾（来源程序会删掉原文）
     bool entered;           // 已经给它发过 enter
@@ -510,6 +510,7 @@ static void deliver_data(void)
     }
     log_info(L"X11 拖放：数据读完了，%ls %zu 字节", drag_kind == XDND_KIND_IMAGE ? L"图片" : drag_kind == XDND_KIND_FILES ? L"文件列表" : L"文字",
         (size_t)(incoming ? incoming->len : 0));
+    bool accepted = false;
     if (target && target->drop)
     {
         int point_x = drag_has_position ? drag_point_x : 0, point_y = drag_has_position ? drag_point_y : 0;
@@ -523,10 +524,14 @@ static void deliver_data(void)
             }
         }
         int local_x = 0, local_y = 0;
-        if (sink_contains(target, point_x, point_y, &local_x, &local_y)) target->drop(target->context, &payload, local_x, local_y);
-        else log_info(L"X11 拖放：松手时已经不在置物架上，丢弃");
+        if (sink_contains(target, point_x, point_y, &local_x, &local_y))
+            accepted = target->drop(target->context, &payload, local_x, local_y);
+        else
+            log_info(L"X11 拖放：松手时已经不在置物架上，丢弃");
     }
-    send_finished(target != NULL);
+    // 置物架没收下（正忙、数据解不开……）时回失败：我们答应过“移动”的话，来源就不会删原文。
+    if (!accepted) log_info(L"X11 拖放：置物架没有收下这次的内容，回 XdndFinished 失败");
+    send_finished(accepted);
     g_free(text);
     reset_drag();
 }
@@ -660,6 +665,7 @@ static struct
 
 static void source_finish(bool dropped);
 static gboolean source_batch_start(gpointer data);
+static void served_clear(void);
 
 /// 排着队、主拖动放下后一批一批送出去的内容。
 typedef struct SourceBatch
@@ -669,6 +675,7 @@ typedef struct SourceBatch
 } SourceBatch;
 
 static GQueue batches = G_QUEUE_INIT;
+static bool batches_failed;         // 排着的批次里有没送出去的
 
 static void source_batch_free(SourceBatch *batch)
 {
@@ -696,11 +703,22 @@ static void source_batches_cancel(bool report)
     source_batches_clear();
     // 正在送某一批时收尾还没推迟：source_finish 会自己处理，这里不做。
     if (!pending) return;
-    GdkDragAction action = source.batch_report;
+    // 排着还没送出去的批次全被丢掉了：置物架那边不能当成全部送完。
+    batches_failed = true;
     source.batch_report = 0;
     log_info(L"X11 拖动源：取消排着的分批");
     // 分批排着的时候，置物架那次拖出的收尾是推迟的；取消时补上，别让它一直停在“正在拖”。
-    if (report) ui_drag_taken_over_finished(action);
+    // 全按取消（动作 0）收尾：没送到的内容，置物架上的项目都得留着。
+    if (report) ui_drag_taken_over_finished(0);
+}
+
+/// 有批次没送出去时按取消收尾（动作 0）：置物架上的项目都留着，免得没送到的内容跟着一起消失。
+/// 送出去的几项也留在架上——用户看得见，可以自己删掉，总比丢掉好。
+static GdkDragAction batch_result(GdkDragAction action)
+{
+    if (!batches_failed) return action;
+    log_info(L"X11 拖动源：有批次没送出去，按取消收尾，项目留在置物架上");
+    return 0;
 }
 
 static void source_clear_payload(void)
@@ -764,7 +782,13 @@ static void source_paths_build(const char *const *paths, int count, char **uri_l
 
 void xdnd_source_set_payload(const char *const *paths, int count, const char *text, const char *html, bool move_allowed)
 {
-    if (source.active || source.starting) return;
+    // 上一次拖出还没收完（多半是接收方一直没回 XdndFinished）：先按取消收尾。
+    // 不能直接返回：这次的内容会被丢掉，而上一次的内容还留着，下一批会被当成这次要送的。
+    if (source.active || source.starting)
+    {
+        log_info(L"X11 拖动源：上一次拖出还没收完，先收尾再准备这次的内容");
+        source_finish(false);
+    }
     // 上一次拖出还留着 selection：新的一次要开始了，立刻收回来，别让旧数据再被取到。
     if (source.assist_clear_source)
     {
@@ -775,6 +799,8 @@ void xdnd_source_set_payload(const char *const *paths, int count, const char *te
         xcb_set_selection_owner(bridge.connection, XCB_ATOM_NONE, bridge.atoms.selection, XCB_CURRENT_TIME);
     source.assisting = false;
     source_batches_cancel(true);
+    // 放在取消之后：取消排着的批次会置上这个标记，那是上一次拖出的事，不能带进这一次。
+    batches_failed = false;
     source_clear_payload();
     source.move_allowed = move_allowed;
     source.html = html && *html ? g_strdup(html) : NULL;
@@ -1081,6 +1107,18 @@ static void source_send_leave(void)
     source.have_point = false;
 }
 
+/// 看不到全局按键时（没有 /dev/input 权限）退一步问 X：现在左键按着没有。拿不到时返回 -1。
+static int x_button_state(void)
+{
+    if (!bridge.connection || !bridge.screen) return -1;
+    xcb_query_pointer_reply_t *reply = xcb_query_pointer_reply(bridge.connection,
+        xcb_query_pointer(bridge.connection, bridge.screen->root), NULL);
+    if (!reply) return -1;
+    int state = (reply->mask & XCB_BUTTON_MASK_1) ? 1 : 0;
+    free(reply);
+    return state;
+}
+
 /// 光标在接收方窗口里的本地坐标 -> X 根坐标。缩放过的屏幕上两边的尺寸不一样，按比例折算。
 static bool source_root_position(int *root_x, int *root_y)
 {
@@ -1157,10 +1195,11 @@ static bool source_start(void)
 /// 排着的批次不再送了：清掉队列，把置物架那次拖出的收尾补上。
 static void source_batches_abort(void)
 {
+    batches_failed = true;
     source_batches_cancel(false);
     GdkDragAction action = source.batch_report;
     source.batch_report = 0;
-    ui_drag_taken_over_finished(action);
+    ui_drag_taken_over_finished(batch_result(action));
 }
 
 static void source_finish(bool dropped)
@@ -1175,6 +1214,8 @@ static void source_finish(bool dropped)
     // 还有排着的批次、而且这一批真的放下了：记下窗口和落点，等一下接着送下一批。
     // 主拖动被拒或者取消时就不再送了，剩下的内容留在置物架上。
     bool next = dropped && source.accepted && !g_queue_is_empty(&batches);
+    // 这一批没送出去：排着没送的、连同已经送的，都不能当成“整组移动完成”。
+    if (batching && !dropped) batches_failed = true;
     if (next)
     {
         source.batch_window = source.target;
@@ -1232,7 +1273,11 @@ static void source_finish(bool dropped)
     }
     source_batches_clear();
     source.batch_report = 0;
-    ui_drag_taken_over_finished(action);
+    // 这次拖出到这里就算结束了：内容不能留到下一次拖动（否则下一次会把旧内容发出去）。
+    source_clear_payload();
+    source.move_allowed = false;
+    served_clear();
+    ui_drag_taken_over_finished(batch_result(action));
 }
 
 /// 送下一批：取出排在最前面的一批，重新和同一个窗口走一遍 Xdnd，不需要鼠标按键。
@@ -1243,7 +1288,10 @@ static gboolean source_batch_start(gpointer data)
     SourceBatch *batch = g_queue_pop_head(&batches);
     if (!batch)
     {
-        source_batches_abort();
+        // 队列在定时器响之前被清掉了（防御性分支）：没有失败可言，按正常收尾。
+        GdkDragAction action = source.batch_report;
+        source.batch_report = 0;
+        ui_drag_taken_over_finished(action);
         return G_SOURCE_REMOVE;
     }
     if (source.active || source.starting || source.assisting || !bridge.connection)
@@ -1349,6 +1397,73 @@ static void source_send_notify(xcb_selection_request_event_t *request, xcb_atom_
     xcb_flush(bridge.connection);
 }
 
+// ───────────── 分段送数据（ICCCM 的 INCR）─────────────
+// X 的一次请求有上限（常见 256 KB 上下），一次 xcb_change_property 写不完很长的文字。
+// 超过一块时先写一个 INCR 类型、内容是总长度的属性，对方删掉属性后一段段接着写，
+// 最后再写一个零长度的收尾。写太长的文本时，WPS 这类程序就靠这个拿到完整内容。
+
+#define INCR_CHUNK_SIZE ((size_t)128 * 1024)
+
+static struct
+{
+    bool active;
+    xcb_window_t requestor;
+    xcb_atom_t property, type;
+    char *data;
+    size_t length, offset;
+} served;
+
+static void served_clear(void)
+{
+    if (!served.active) return;
+    served.active = false;
+    g_free(served.data);
+    served.data = NULL;
+    served.length = served.offset = 0;
+}
+
+/// 写下一块；对方删掉属性以后才写（见 handle_property_notify）。
+static void served_step(void)
+{
+    if (!served.active || !bridge.connection) return;
+    size_t remaining = served.length - served.offset;
+    if (remaining == 0)
+    {
+        // ICCCM：写完数据再写一个零长度的属性，对方才知道收齐了。
+        xcb_change_property(bridge.connection, XCB_PROP_MODE_REPLACE, served.requestor, served.property, served.type, 8, 0,
+            NULL);
+        xcb_flush(bridge.connection);
+        served_clear();
+        return;
+    }
+    size_t chunk = remaining > INCR_CHUNK_SIZE ? INCR_CHUNK_SIZE : remaining;
+    xcb_change_property(bridge.connection, XCB_PROP_MODE_REPLACE, served.requestor, served.property, served.type, 8,
+        (uint32_t)chunk, served.data + served.offset);
+    xcb_flush(bridge.connection);
+    served.offset += chunk;
+}
+
+static void served_begin(xcb_selection_request_event_t *request, xcb_atom_t property, xcb_atom_t type, const char *data,
+    size_t length)
+{
+    served_clear();
+    served.active = true;
+    served.requestor = request->requestor;
+    served.property = property;
+    served.type = type;
+    served.data = g_strdup(data);
+    served.length = length;
+    served.offset = 0;
+    // 对方删掉属性时要收到通知，才知道可以写下一段。事件掩码是每个客户端各算各的，不影响对方自己选的。
+    uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
+    xcb_change_window_attributes(bridge.connection, request->requestor, XCB_CW_EVENT_MASK, &mask);
+    uint32_t total = (uint32_t)length;
+    xcb_change_property(bridge.connection, XCB_PROP_MODE_REPLACE, request->requestor, property, bridge.atoms.incr, 32, 1,
+        &total);
+    log_info(L"X11 拖动源：数据 %zu 字节，改成分段送（INCR）", length);
+    source_send_notify(request, property);
+}
+
 static void source_serve_selection(xcb_selection_request_event_t *request)
 {
     if (!bridge.connection || !source.window) return;
@@ -1358,6 +1473,8 @@ static void source_serve_selection(xcb_selection_request_event_t *request)
         return;
     }
     xcb_atom_t property = request->property ? request->property : request->target;
+    // 上一次分段送还没写完、对方又改要别的格式：先把上一次收掉。
+    if (served.active && (served.requestor != request->requestor || served.property != property)) served_clear();
     if (request->target == bridge.atoms.targets)
     {
         xcb_atom_t atoms[8];
@@ -1411,6 +1528,11 @@ static void source_serve_selection(xcb_selection_request_event_t *request)
         source.drop_types |= drop_type;
     }
     size_t length = strlen(data);
+    if (length > INCR_CHUNK_SIZE)
+    {
+        served_begin(request, property, type, data, length);
+        return;
+    }
     xcb_change_property(bridge.connection, XCB_PROP_MODE_REPLACE, request->requestor, property, type, 8, (uint32_t)length, data);
     log_info(L"X11 拖动源：对方来要数据（%ls），给了 %zu 字节",
         type == bridge.atoms.uri_list ? L"文件列表" : type == bridge.atoms.text_html ? L"HTML" : L"文字", length);
@@ -1523,7 +1645,10 @@ static void source_tick(gint64 now)
         }
     }
     source_send_position();
-    if (gesture_left_button_state() == 0) source_send_drop();
+    int buttons = gesture_left_button_state();
+    // 键盘设备打不开时（-1）手边这套读不到按键，就退一步问 X；不然会一直不松手，30 秒后才取消。
+    if (buttons < 0) buttons = x_button_state();
+    if (buttons == 0) source_send_drop();
 }
 
 bool xdnd_source_should_take_over(void)
@@ -1623,6 +1748,9 @@ static void handle_enter(xcb_client_message_event_t *event)
     if (drag_kind == XDND_KIND_NONE)
     {
         log_info(L"X11 拖放：没有能用的格式，不接");
+        // 明确回绝并收掉这次拖动：不回的话拖动源会一直等，铺满屏幕的接放窗口也会一直挂着吃点击。
+        send_status(false, XCB_ATOM_NONE);
+        reset_drag();
         return;
     }
     log_info(L"X11 拖放：%hs 送上来（源窗口 0x%x，Xdnd %d）", kind_name(drag_kind), (unsigned)drag_source, drag_version);
@@ -1723,6 +1851,13 @@ static void handle_selection_notify(xcb_selection_notify_event_t *event)
 
 static void handle_property_notify(xcb_property_notify_event_t *event)
 {
+    // 我们当拖动源、分段送数据：对方把属性删掉了，就该接着写下一段。
+    if (served.active && event->window == served.requestor && event->atom == served.property
+        && event->state == XCB_PROPERTY_DELETE)
+    {
+        served_step();
+        return;
+    }
     if (!reading || !incremental || event->window != bridge.window) return;
     if (event->atom != bridge.atoms.data_property || event->state != XCB_PROPERTY_NEW_VALUE) return;
     read_property_chunk(false);
@@ -1934,6 +2069,8 @@ void xdnd_stop(void)
     }
     source_batches_clear();
     source.batch_report = 0;
+    batches_failed = false;
+    served_clear();
     source.target = 0;
     source.entered = 0;
     source.waiting_finish = false;
@@ -1982,7 +2119,7 @@ XdndSink *xdnd_add_sink(void *context,
     void (*enter)(void *context, XdndKind kind, double x, double y),
     void (*motion)(void *context, XdndKind kind, double x, double y),
     void (*leave)(void *context),
-    void (*drop)(void *context, const XdndPayload *payload, double x, double y),
+    bool (*drop)(void *context, const XdndPayload *payload, double x, double y),
     bool (*frame)(void *context, int *x, int *y, int *width, int *height),
     bool (*want_move)(void *context))
 {

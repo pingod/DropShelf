@@ -1648,10 +1648,10 @@ static void x11_drag_leave(void *context)
     shelf_drop_phase(shelf, UI_DROP_LEAVE, DROP_NONE, false, NULL, 0, 0, &action);
 }
 
-static void x11_drag_drop(void *context, const XdndPayload *payload, double x, double y)
+static bool x11_drag_drop(void *context, const XdndPayload *payload, double x, double y)
 {
     ShelfWindow *shelf = context;
-    if (!payload) return;
+    if (!payload) return false;
     GValue value = G_VALUE_INIT;
     bool have_value = false;
     if (payload->kind == XDND_KIND_FILES)
@@ -1690,8 +1690,11 @@ static void x11_drag_drop(void *context, const XdndPayload *payload, double x, d
     }
     log_info(L"X11 拖入：在（%g, %g）放下，%ls", x, y, xdnd_kind_name(payload->kind));
     GdkDragAction action = GDK_ACTION_COPY;
-    shelf_drop_phase(shelf, UI_DROP_DROP, xdnd_kind(payload->kind), false, have_value ? &value : NULL, x, y, &action);
+    // 返回给 X11 拖动源：没收下就回 XdndFinished 失败，来源按“移动”提议的话不会删除原文。
+    bool accepted = have_value
+        && shelf_drop_phase(shelf, UI_DROP_DROP, xdnd_kind(payload->kind), false, &value, x, y, &action);
     if (G_IS_VALUE(&value)) g_value_unset(&value);
+    return accepted;
 }
 
 /// 顶部“复制/移动”开关也管拖进来的东西：移动时按移动收尾，WPS、Obsidian 这些来源松手后会删掉原文。
