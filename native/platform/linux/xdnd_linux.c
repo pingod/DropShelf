@@ -613,6 +613,9 @@ static void read_property_chunk(bool first)
 #define DROP_TYPE_URI_LIST 1u
 #define DROP_TYPE_TEXT 2u
 #define DROP_TYPE_HTML 4u
+#define DROP_TYPE_IMAGE 8u
+/// 图片原样塞进 selection 的上限；再大就只给文件 URI，别让一次拖出搬几十兆。
+#define MAXIMUM_IMAGE_BYTES ((gsize)32 * 1024 * 1024)
 
 static struct
 {
@@ -621,6 +624,9 @@ static struct
     char *uri_list;                 // text/uri-list 的内容（\r\n 分隔）
     char *text;                     // 纯文字；有文件时是路径列表
     char *html;                     // text/html：混合拖出时把文字和图片放在一起
+    char *image;                    // 单张图片的原文件内容：微信这类程序只把它当图片收
+    size_t image_length;
+    xcb_atom_t image_type;          // image/png 或 image/jpeg
     bool move_allowed;
     uint32_t drop_types;            // 发出 XdndDrop 以后对方取了哪些格式（DROP_TYPE_*）
     // 自动分批：一次拖出分成几批送给同一个窗口，不用鼠标按键。
@@ -726,10 +732,36 @@ static void source_clear_payload(void)
     g_free(source.uri_list);
     g_free(source.text);
     g_free(source.html);
+    g_free(source.image);
     source.uri_list = NULL;
     source.text = NULL;
     source.html = NULL;
+    source.image = NULL;
+    source.image_length = 0;
+    source.image_type = XCB_ATOM_NONE;
     source.prepared = false;
+}
+
+/// 单张图片再按图片格式备一份：微信只认 image/png（image/jpeg 同理），文件 URI 它当文字插进去。
+static void source_image_load(const char *path)
+{
+    if (!bridge.connection || !path || !*path) return;
+    const char *dot = strrchr(path, '.');
+    if (!dot) return;
+    xcb_atom_t type = XCB_ATOM_NONE;
+    if (g_ascii_strcasecmp(dot, ".png") == 0) type = bridge.atoms.image_png;
+    else if (g_ascii_strcasecmp(dot, ".jpg") == 0 || g_ascii_strcasecmp(dot, ".jpeg") == 0) type = bridge.atoms.image_jpeg;
+    if (type == XCB_ATOM_NONE) return;
+    char *data = NULL;
+    gsize length = 0;
+    if (!g_file_get_contents(path, &data, &length, NULL) || length == 0 || length > MAXIMUM_IMAGE_BYTES)
+    {
+        g_free(data);
+        return;
+    }
+    source.image = data;
+    source.image_length = length;
+    source.image_type = type;
 }
 
 /// 路径里的特殊字节按 URI 的规矩转义：WPS 这类程序要的是能直接用的 file:// URI。
@@ -807,7 +839,8 @@ void xdnd_source_set_payload(const char *const *paths, int count, const char *te
     source.drop_types = 0;
     source_paths_build(paths, count, &source.uri_list, &source.text);
     if (!source.uri_list && !source.text && text && *text) source.text = g_strdup(text);
-    source.prepared = source.uri_list != NULL || source.text != NULL || source.html != NULL;
+    if (count == 1 && paths && paths[0]) source_image_load(paths[0]);
+    source.prepared = source.uri_list != NULL || source.text != NULL || source.html != NULL || source.image != NULL;
     source.proposed = source.move_allowed ? bridge.atoms.action_move : bridge.atoms.action_copy;
     log_trace(L"X11 拖动源：准备好内容（%d 个文件，文字 %ls，HTML %ls，排着 %u 批，%ls），提议动作 0x%x（移动 0x%x，复制 0x%x）", count,
         source.text ? L"有" : L"无", source.html ? L"有" : L"无", g_queue_get_length(&batches),
@@ -915,7 +948,9 @@ static uint32_t window_pid(xcb_window_t window)
 static bool window_aware(xcb_window_t window)
 {
     if (!bridge.connection || !bridge.atoms.aware) return false;
-    xcb_get_property_cookie_t cookie = xcb_get_property(bridge.connection, 0, window, bridge.atoms.aware, XCB_ATOM_ATOM, 0, 1);
+    // 不能要求属性类型是 ATOM：微信把它写成了 BITMAP，值倒还是版本号。类型不查，读到的第一个 32 位值算数。
+    xcb_get_property_cookie_t cookie =
+        xcb_get_property(bridge.connection, 0, window, bridge.atoms.aware, XCB_GET_PROPERTY_TYPE_ANY, 0, 1);
     xcb_get_property_reply_t *reply = xcb_get_property_reply(bridge.connection, cookie, NULL);
     bool aware = false;
     if (reply)
@@ -931,10 +966,15 @@ static bool window_aware(xcb_window_t window)
     return aware;
 }
 
-/// 在 X 的顶层窗口里找 pid 那个程序的主窗口：同进程的窗口可能有好几个，取大小最接近的。
+/// 位置和大小都对上才认：两份坐标都是屏幕坐标，差几个像素是窗口边框，差几十就说明不是同一个窗口。
+#define TARGET_GEOMETRY_TOLERANCE 64
+
+/// 在 X 的顶层窗口里找接收方：先按 pid 找；找不到再按位置和大小对。
+/// 微信的 _NET_WM_PID 写成了 22（不是它真正的 pid），只按 pid 找会把微信整个漏掉，
+/// 落回 Hyprland 那条路，而它会把落下的数据换成剪贴板内容。
 static bool source_find_target(int pid, const RECT *rect)
 {
-    if (!bridge.connection || !bridge.screen || pid <= 0 || !rect) return false;
+    if (!bridge.connection || !bridge.screen || !rect) return false;
     int width = rect->right - rect->left;
     int height = rect->bottom - rect->top;
     if (width <= 0 || height <= 0) return false;
@@ -946,29 +986,47 @@ static bool source_find_target(int pid, const RECT *rect)
     int best_width = 0, best_height = 0;
     int count = xcb_query_tree_children_length(tree);
     xcb_window_t *children = xcb_query_tree_children(tree);
-    for (int index = 0; index < count; index++)
+    for (int pass = 0; pass < 2 && !best; pass++)
     {
-        xcb_window_t window = children[index];
-        if (!window || window_pid(window) != (uint32_t)pid) continue;
-        if (!window_aware(window)) continue;
-        xcb_get_window_attributes_reply_t *attributes =
-            xcb_get_window_attributes_reply(bridge.connection, xcb_get_window_attributes(bridge.connection, window), NULL);
-        bool viewable = attributes && attributes->map_state == XCB_MAP_STATE_VIEWABLE;
-        free(attributes);
-        if (!viewable) continue;
-        xcb_get_geometry_reply_t *geometry = xcb_get_geometry_reply(bridge.connection, xcb_get_geometry(bridge.connection, window), NULL);
-        if (!geometry) continue;
-        int score = abs((int)geometry->width - width) + abs((int)geometry->height - height);
-        if (!best || score < best_score)
+        for (int index = 0; index < count; index++)
         {
-            best = window;
-            best_score = score;
-            best_x = geometry->x;
-            best_y = geometry->y;
-            best_width = geometry->width;
-            best_height = geometry->height;
+            xcb_window_t window = children[index];
+            if (!window || window == source.window) continue;
+            if (pass == 0 && (pid <= 0 || window_pid(window) != (uint32_t)pid)) continue;
+            if (!window_aware(window)) continue;
+            xcb_get_window_attributes_reply_t *attributes = xcb_get_window_attributes_reply(
+                bridge.connection, xcb_get_window_attributes(bridge.connection, window), NULL);
+            bool viewable = attributes && attributes->map_state == XCB_MAP_STATE_VIEWABLE;
+            free(attributes);
+            if (!viewable) continue;
+            xcb_get_geometry_reply_t *geometry =
+                xcb_get_geometry_reply(bridge.connection, xcb_get_geometry(bridge.connection, window), NULL);
+            if (!geometry) continue;
+            int score;
+            if (pass == 0)
+                score = abs((int)geometry->width - width) + abs((int)geometry->height - height);
+            else
+            {
+                // pid 不可靠时，位置和大小都得对上；差得多的窗口一律不认，免得把拖动递给旁边的程序。
+                score = abs((int)geometry->x - (int)rect->left) + abs((int)geometry->y - (int)rect->top)
+                    + abs((int)geometry->width - width) + abs((int)geometry->height - height);
+                if (score > TARGET_GEOMETRY_TOLERANCE)
+                {
+                    free(geometry);
+                    continue;
+                }
+            }
+            if (!best || score < best_score)
+            {
+                best = window;
+                best_score = score;
+                best_x = geometry->x;
+                best_y = geometry->y;
+                best_width = geometry->width;
+                best_height = geometry->height;
+            }
+            free(geometry);
         }
-        free(geometry);
     }
     free(tree);
     if (!best) return false;
@@ -985,7 +1043,9 @@ static bool source_find_target(int pid, const RECT *rect)
 static int source_type_atoms(xcb_atom_t *out, int max)
 {
     int count = 0;
-    // HTML 放最前面：认 HTML 的程序（文档程序）拿到它就能一次把文字和图片都插进去。
+    // 图片放最前面：聊天程序见到图片就按图片发，否则它会把文件 URI 当文字插进输入框。
+    if (source.image && count < max) out[count++] = source.image_type;
+    // 再是 HTML：认 HTML 的程序（文档程序）拿到它就能一次把文字和图片都插进去。
     if (source.html && count < max) out[count++] = bridge.atoms.text_html;
     if (source.uri_list && count < max) out[count++] = bridge.atoms.uri_list;
     if (source.text)
@@ -1330,6 +1390,11 @@ static gboolean source_batch_start(gpointer data)
     batch->text = NULL;
     g_free(source.html);
     source.html = NULL;
+    // 分批送的都是文件 URI 和文字，不拆图片；上一批的图片内容不能跟着这一批发出去。
+    g_free(source.image);
+    source.image = NULL;
+    source.image_length = 0;
+    source.image_type = XCB_ATOM_NONE;
     source_batch_free(batch);
     source.prepared = source.uri_list != NULL || source.text != NULL;
     source.move_allowed = false;
@@ -1451,7 +1516,9 @@ static void served_begin(xcb_selection_request_event_t *request, xcb_atom_t prop
     served.requestor = request->requestor;
     served.property = property;
     served.type = type;
-    served.data = g_strdup(data);
+    // 按长度拷，不能 g_strdup：图片是二进制，中间可能有 NUL。
+    served.data = g_malloc(length > 0 ? length : 1);
+    if (length > 0) memcpy(served.data, data, length);
     served.length = length;
     served.offset = 0;
     // 对方删掉属性时要收到通知，才知道可以写下一段。事件掩码是每个客户端各算各的，不影响对方自己选的。
@@ -1480,6 +1547,7 @@ static void source_serve_selection(xcb_selection_request_event_t *request)
         xcb_atom_t atoms[8];
         int count = 0;
         atoms[count++] = bridge.atoms.targets;
+        if (source.image) atoms[count++] = source.image_type;
         if (source.html) atoms[count++] = bridge.atoms.text_html;
         if (source.uri_list) atoms[count++] = bridge.atoms.uri_list;
         if (source.text)
@@ -1495,7 +1563,15 @@ static void source_serve_selection(xcb_selection_request_event_t *request)
     const char *data = NULL;
     xcb_atom_t type = XCB_ATOM_NONE;
     uint32_t drop_type = 0;
-    if (request->target == bridge.atoms.uri_list && source.uri_list)
+    size_t binary_length = 0;
+    if (source.image && request->target == source.image_type)
+    {
+        data = source.image;
+        type = source.image_type;
+        drop_type = DROP_TYPE_IMAGE;
+        binary_length = source.image_length;
+    }
+    else if (request->target == bridge.atoms.uri_list && source.uri_list)
     {
         data = source.uri_list;
         type = bridge.atoms.uri_list;
@@ -1524,18 +1600,19 @@ static void source_serve_selection(xcb_selection_request_event_t *request)
     if (source.waiting_finish)
     {
         if (!(source.drop_types & drop_type)) log_info(L"X11 拖动源：对方放下时取了%ls", type == bridge.atoms.uri_list ? L"文件列表"
-            : type == bridge.atoms.text_html ? L"HTML" : L"文字");
+            : type == bridge.atoms.text_html ? L"HTML" : drop_type == DROP_TYPE_IMAGE ? L"图片" : L"文字");
         source.drop_types |= drop_type;
     }
-    size_t length = strlen(data);
+    const wchar_t *name = type == bridge.atoms.uri_list ? L"文件列表"
+        : type == bridge.atoms.text_html ? L"HTML" : drop_type == DROP_TYPE_IMAGE ? L"图片" : L"文字";
+    size_t length = binary_length ? binary_length : strlen(data);
     if (length > INCR_CHUNK_SIZE)
     {
         served_begin(request, property, type, data, length);
         return;
     }
     xcb_change_property(bridge.connection, XCB_PROP_MODE_REPLACE, request->requestor, property, type, 8, (uint32_t)length, data);
-    log_info(L"X11 拖动源：对方来要数据（%ls），给了 %zu 字节",
-        type == bridge.atoms.uri_list ? L"文件列表" : type == bridge.atoms.text_html ? L"HTML" : L"文字", length);
+    log_info(L"X11 拖动源：对方来要数据（%ls），给了 %zu 字节", name, length);
     source_send_notify(request, property);
 }
 
